@@ -1,151 +1,125 @@
 # social_network.py
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
-import sqlite3
+from neo4j import GraphDatabase
 from dataclasses import dataclass
 from typing import List, Optional
 
 # ======================
 # Database Access Layer
 # ======================
+
+
 class Database:
-    def __init__(self, db_name='social_network.db'):
-        self.db_name = db_name
-        self._init_db()
-    
+    def __init__(self, uri="neo4j+s://8f4e88d9.databases.neo4j.io", user="neo4j", password="RXI3OqfrD0lUSgTG4nJeGmUzce-3wFu8m62xUK0F4o"):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    def close(self):
+        self.driver.close()
+
     def _init_db(self):
-        with self._get_connection() as conn:
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE NOT NULL,
-                    name TEXT NOT NULL
-                )
-            ''')
-            
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS posts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    content TEXT NOT NULL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(user_id) REFERENCES users(id)
-                )
-            ''')
-            
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS followers (
-                    follower_id INTEGER NOT NULL,
-                    followee_id INTEGER NOT NULL,
-                    PRIMARY KEY(follower_id, followee_id),
-                    FOREIGN KEY(follower_id) REFERENCES users(id),
-                    FOREIGN KEY(followee_id) REFERENCES users(id)
-                )
-            ''')
-    
-    def _get_connection(self):
-        return sqlite3.connect(self.db_name)
+        with self.driver.session() as session:
+            session.run("""
+            CREATE CONSTRAINT unique_user_id IF NOT EXISTS 
+            FOR (u:User) REQUIRE u.id IS UNIQUE
+        """)
+            session.run("""
+            CREATE CONSTRAINT unique_username IF NOT EXISTS 
+            FOR (u:User) REQUIRE u.username IS UNIQUE
+        """)
     
     # User operations
     def create_user(self, username: str, name: str) -> int:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('INSERT INTO users (username, name) VALUES (?, ?)', (username, name))
-            return cursor.lastrowid
-    
+        with self.driver.session() as session:
+            result = session.run(
+                "CREATE (u:User {username: $username, name: $name}) RETURN id(u) AS user_id",
+                username=username,
+                name=name
+            )
+            return result.single()["user_id"]
+
     def get_user(self, user_id: int) -> Optional[dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT id, username, name FROM users WHERE id = ?', (user_id,))
-            row = cursor.fetchone()
-            return {'id': row[0], 'username': row[1], 'name': row[2]} if row else None
-    
+        with self.driver.session() as session:
+            result = session.run(
+                "MATCH (u:User) WHERE id(u) = $id RETURN id(u) AS id, u.username AS username, u.name AS name",
+                id=user_id
+            )
+            record = result.single()
+            return dict(record) if record else None
+
     def get_all_users(self) -> List[dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT id, username, name FROM users')
-            return [{'id': row[0], 'username': row[1], 'name': row[2]} for row in cursor.fetchall()]
-    
+        with self.driver.session() as session:
+            result = session.run("MATCH (u:User) RETURN id(u) AS id, u.username AS username, u.name AS name")
+            return [dict(record) for record in result]
+
     # Post operations
     def create_post(self, user_id: int, content: str) -> int:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('INSERT INTO posts (user_id, content) VALUES (?, ?)', (user_id, content))
-            return cursor.lastrowid
-    
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (u:User) WHERE id(u) = $user_id
+                CREATE (u)-[:POSTED]->(p:Post {content: $content, timestamp: timestamp()})
+                RETURN id(p) AS post_id
+            """, user_id=user_id, content=content)
+            return result.single()["post_id"]
+
     def get_posts_by_user(self, user_id: int) -> List[dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT p.id, p.content, p.timestamp, u.username, u.name 
-                FROM posts p JOIN users u ON p.user_id = u.id 
-                WHERE p.user_id = ?
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (u:User)-[:POSTED]->(p:Post)
+                WHERE id(u) = $user_id
+                RETURN id(p) AS id, p.content AS content, p.timestamp AS timestamp,
+                       u.username AS username, u.name AS name
                 ORDER BY p.timestamp DESC
-            ''', (user_id,))
-            return [{
-                'id': row[0],
-                'content': row[1],
-                'timestamp': row[2],
-                'username': row[3],
-                'name': row[4]
-            } for row in cursor.fetchall()]
-    
+            """, user_id=user_id)
+            return [dict(record) for record in result]
+
     def get_feed(self, user_id: int) -> List[dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT p.id, p.content, p.timestamp, u.username, u.name 
-                FROM posts p 
-                JOIN users u ON p.user_id = u.id
-                JOIN followers f ON p.user_id = f.followee_id
-                WHERE f.follower_id = ?
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (me:User)-[:FOLLOWS]->(u:User)-[:POSTED]->(p:Post)
+                WHERE id(me) = $user_id
+                RETURN id(p) AS id, p.content AS content, p.timestamp AS timestamp,
+                       u.username AS username, u.name AS name
                 ORDER BY p.timestamp DESC
-            ''', (user_id,))
-            return [{
-                'id': row[0],
-                'content': row[1],
-                'timestamp': row[2],
-                'username': row[3],
-                'name': row[4]
-            } for row in cursor.fetchall()]
-    
+            """, user_id=user_id)
+            return [dict(record) for record in result]
+
     # Follow operations
     def follow_user(self, follower_id: int, followee_id: int) -> bool:
-        with self._get_connection() as conn:
-            try:
-                conn.execute('INSERT INTO followers (follower_id, followee_id) VALUES (?, ?)', 
-                           (follower_id, followee_id))
-                return True
-            except sqlite3.IntegrityError:
-                return False
-    
-    def get_followers(self, user_id: int) -> List[dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT u.id, u.username, u.name 
-                FROM followers f 
-                JOIN users u ON f.follower_id = u.id
-                WHERE f.followee_id = ?
-            ''', (user_id,))
-            return [{'id': row[0], 'username': row[1], 'name': row[2]} for row in cursor.fetchall()]
-    
-    def get_following(self, user_id: int) -> List[dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT u.id, u.username, u.name 
-                FROM followers f 
-                JOIN users u ON f.followee_id = u.id
-                WHERE f.follower_id = ?
-            ''', (user_id,))
-            return [{'id': row[0], 'username': row[1], 'name': row[2]} for row in cursor.fetchall()]
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (a:User), (b:User)
+                WHERE id(a) = $follower_id AND id(b) = $followee_id
+                MERGE (a)-[:FOLLOWS]->(b)
+            """, follower_id=follower_id, followee_id=followee_id)
+            return True
 
     def unfollow_user(self, follower_id: int, followee_id: int) -> bool:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM followers WHERE follower_id = ? AND followee_id = ?', 
-                        (follower_id, followee_id))
-            return cursor.rowcount > 0
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (a:User)-[r:FOLLOWS]->(b:User)
+                WHERE id(a) = $follower_id AND id(b) = $followee_id
+                DELETE r
+                RETURN COUNT(r) AS deleted
+            """, follower_id=follower_id, followee_id=followee_id)
+            return result.single()["deleted"] > 0
+
+    def get_followers(self, user_id: int) -> List[dict]:
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (f:User)-[:FOLLOWS]->(u:User)
+                WHERE id(u) = $user_id
+                RETURN id(f) AS id, f.username AS username, f.name AS name
+            """, user_id=user_id)
+            return [dict(record) for record in result]
+
+    def get_following(self, user_id: int) -> List[dict]:
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (u:User)-[:FOLLOWS]->(f:User)
+                WHERE id(u) = $user_id
+                RETURN id(f) AS id, f.username AS username, f.name AS name
+            """, user_id=user_id)
+            return [dict(record) for record in result]
 
 # ======================
 # Web Application
